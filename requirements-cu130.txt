@@ -1,0 +1,49 @@
+# Ditto on NVIDIA Blackwell (RTX 50-series, sm_120) — CUDA 13 stack.
+#
+# WHY THIS FILE EXISTS. environment.yaml pins torch 2.5.1+cu121 and
+# tensorrt 8.6.1. Neither supports Blackwell: cu121 wheels carry no sm_120
+# kernels, and TensorRT 8.6.1 predates the architecture entirely. The shipped
+# engines in ditto_trt_Ampere_Plus are built at
+# hardware-compatibility-level=Ampere_Plus, which reads as inclusive but was
+# produced by a TensorRT that has never seen an sm_120 device.
+#
+# This stack runs the PYTORCH path instead — no TensorRT, no engine rebuild.
+# Verified on an RTX 5090 (driver 591.86): torch reports
+# arch_list ['sm_75','sm_80','sm_86','sm_90','sm_100','sm_120'] and executes.
+#
+# Install (venv, no conda needed — conda would drag in its own CUDA):
+#   uv venv --python 3.10 .venv && . .venv/bin/activate
+#   uv pip install --index-url https://download.pytorch.org/whl/cu130 \
+#       torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+#   uv pip install -r requirements-cu130.txt
+#
+# ⛔ DO NOT install onnxruntime-gpu. It requires a complete CUDA 12 runtime
+# (libcublasLt.so.12, libcufft.so.11, …) alongside a CUDA 13 torch. It fails
+# to load its provider and falls back to CPU *silently* — the warning changes
+# shape depending on which library is missing first, so it is easy to believe
+# you are on the GPU when you are not. Measured: no throughput difference
+# either way, because the ONNX stages are not the bottleneck (see BLACKWELL.md).
+
+# --- torch triple: install separately from the cu130 index, see above ---
+# torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
+
+librosa
+soundfile
+soxr
+audioread
+numba
+llvmlite
+scikit-image
+scikit-learn
+scipy
+opencv-python-headless
+imageio
+imageio-ffmpeg
+mediapipe
+onnxruntime          # CPU. Deliberate — see the note above.
+einops
+filetype
+tqdm
+cython
+colored
+huggingface_hub

@@ -38,3 +38,9 @@ prepare_data
 
 !example/audio.wav
 !example/image.png
+
+# --- blackwell fork ---
+checkpoints/
+out/
+.venv/
+*.tmp.mp4

@@ -128,10 +128,9 @@ motion magnitude holds at 2.31–2.45 throughout, so the face does not go stiff 
 step counts — it is a different sample of similar liveliness, not a degraded one.
 Judge it by eye; the metric only says "not collapsed".
 
-**Implication for optimisation work:** attention kernels, `torch.compile` and TRT would
-all have targeted `decode_f3d`, which was never the constraint. Below ~5 steps the
-floor becomes `decode_f3d` (69 ms/frame) and `warp_f3d` (44 ms/frame); 25 fps needs
-40 ms/frame, so that is a ~1.7x ask, not a 10x one.
+**Implication for optimisation work:** at 50 steps `audio2motion` dominates and nothing
+else is worth touching. At the 5 steps this fork defaults to, the floor becomes
+`decode_f3d` and `warp_f3d` — and that ~1.7x ask is what sections 7 and 8 close.
 
 ## 5. Two things that are better than expected
 
@@ -146,7 +145,150 @@ warp/decode to source size is cheap. A large avatar costs nothing.
 
 - TensorRT on Blackwell. Engines would need rebuilding from `ditto_onnx` with a
   TensorRT that supports sm_120. Not attempted.
-- `torch.compile`, fp16/bf16 or fused-attention variants on `decode_f3d`/`warp_f3d`.
+- `torch.compile` and fused-attention variants. (CUDA graphs on
+  `warp_f3d`+`decode_f3d` ARE now measured — see section 8.)
 - Lipsync *quality* at low step counts. Only measured as pixel divergence and motion
   magnitude, which cannot tell you whether the mouth matches the phonemes.
 - Anything on Windows, or on any GPU other than a 5090.
+
+---
+
+## 7. ⛔ Two dependency traps that make every measurement a lie
+
+**`nvidia-cudnn-cu12` overwrites torch's cu13 cuDNN, in place.** Both wheels install to
+`nvidia/cudnn/lib/`, so the cu12 one replaces the files torch 2.11.0+cu130 shipped
+with. This is not a library-search-order problem — `LD_LIBRARY_PATH` cannot fix it,
+the files are gone. Symptom: `torch.backends.cudnn.version()` reports `92400` under a
+cu130 build, and nothing warns. Anything you install that wants CUDA 12 (most
+commonly `onnxruntime-gpu` on Python 3.10) drags it in.
+
+Recovery, measured — note torch will not import between the two commands:
+
+```bash
+uv pip uninstall nvidia-cudnn-cu12
+uv pip install --reinstall-package nvidia-cudnn-cu13 nvidia-cudnn-cu13==9.19.0.56
+```
+
+Wall time was *unaffected* by the contamination here (17.42 s clean vs 17.45 s dirty),
+so this is a correctness trap for your measurements rather than a performance one.
+
+**`onnxruntime-gpu` on Python 3.10 silently runs on the CPU.** The last cp310 wheel is
+1.23.2, a CUDA 12 build; against a cu13 torch it fails to load its provider and falls
+back without raising. The warning text changes depending on which library it misses
+first, which makes it easy to read as noise.
+
+⇒ **Use Python >= 3.11.** `onnxruntime-gpu` 1.26+ is itself a CUDA 13 build
+(`nvidia-cuda-runtime~=13.0`, `nvidia-cufft~=12.0`, `nvidia-cudnn-cu13~=9.0`), so it
+shares torch cu130's stack with nothing to clobber:
+
+```bash
+uv venv --python 3.12 && uv pip install "onnxruntime-gpu[cuda,cudnn]==1.29.0"
+```
+
+Verify it took, rather than trusting the absence of an error:
+
+```python
+sdk.wav2feat.w2f.hubert.model.session.get_providers()
+# ['CUDAExecutionProvider', 'CPUExecutionProvider']   <- not just ['CPUExecutionProvider']
+```
+
+## 8. What actually made it real-time (1.85x, no TensorRT)
+
+### The pipeline was CPU-dispatch-bound, not GPU-bound
+
+Profiled per frame of `warp_f3d`+`decode_f3d` on the clean cu13 stack:
+
+```
+GPU kernel time                      ~8 ms
+CPU time                            20.18 ms
+wall                                20.64 ms
+distinct GPU op invocations/frame     1985
+nvidia-smi utilisation during a run   24-41%
+```
+
+CPU time equals wall time. ~2000 individual op launches per frame, and Python/aten
+dispatch is the cost. This is why a TensorRT engine or a GridSample3D plugin would
+have helped: not because the kernels are slow, but because collapsing the launches
+is. **`grid_sample` itself is 9.3 ms out of 3.9 s — 0.2%.**
+
+### Fix 1 — hubert was inline on the critical path
+
+`wav2feat` (the streaming ONNX audio encoder) ran inside `run_chunk`, on the caller's
+thread, ahead of every queue. On the CPU provider that is 63.9 ms per 200 ms chunk.
+Worse, it costs **11.10 s interleaved with the GPU workers against 5.24 s batched
+alone** — under contention it runs at half speed. Now in its own worker, so a live
+audio producer is never blocked by inference. On CUDA it drops to 13.6 ms.
+
+### Fix 2 — a per-frame host round trip between two GPU stages
+
+`warp_f3d` ended with `.float().cpu().numpy()`; `decode_f3d` began with
+`torch.from_numpy(...).to(device)`. The tensor between them is
+`(1,32,16,64,64)` — 8.4 MB, pulled to the host and pushed straight back, per frame,
+after an fp32 upcast that doubled it. Worth 1.13x on its own; the bigger cost was the
+implied device sync, which drains the GPU between stages.
+
+### Fix 3 — the coordinate grid was rebuilt on the host every forward
+
+`make_coordinate_grid` did `torch.arange(...)` on the **CPU** then copied to device,
+every call, for a grid that depends only on `(spatial_size, dtype, device)` — all
+constant for a run. Now built on device and cached (786 KB, held for the process).
+`dense_motion`'s background `zeros` had the same shape of bug. Worth 1.31x, and it is
+what made the next fix possible at all: `torch.cuda.graph` refuses to capture through
+a non-pinned host->device copy.
+
+### Fix 4 — warp+decode behind one CUDA graph
+
+`core/atomic_components/warp_decode_fused.py`. One replay instead of ~2000 launches,
+one worker thread instead of two, one queue hop fewer.
+
+Per frame, warp+decode:
+
+| path | ms/frame |
+|---|---|
+| original (host round trip) | 24.1 |
+| device-resident + cached grid | 18.4 |
+| **CUDA graph replay** | **14.2** |
+
+Output matches the eager path to `atol=2/255` on identical inputs.
+
+⛔ **Capture eagerly, from `setup()`.** Capturing lazily on the first frame fails
+intermittently with `cudaErrorStreamCaptureInvalidated` — by then `wav2feat`
+(onnxruntime CUDA) and `audio2motion` are issuing work on the same device from other
+threads. The failure surfaces asynchronously, so a `try/except` around the capture
+does not reliably catch it and the run dies instead of falling back. At `setup()` time
+every worker is parked on an empty queue.
+
+### End to end
+
+15.75 s of audio, 394 frames, 5 sampling steps, interleaved A/B (alternating runs, because
+runs get monotonically faster as the GPU warms and a blocked A/B would prove whatever ran
+second):
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| upstream path (`DITTO_FUSE_WARP_DECODE=0`) | 16.55 s | 13.87 s | 18.65 s | **16.36 s** |
+| fused (default) | 9.59 s | 9.57 s | 7.36 s | **8.84 s** |
+
+**1.85x, and 41-54 fps against the 25 fps real-time bar.** The fused path is also far
+more stable — 7.4-9.6 s against 13.9-18.7 s — because once it is no longer
+dispatch-bound the GIL scheduling noise goes with it.
+
+Offline path (`inference.py`, 50 steps, includes the 4.7 s model load): 26.71 s -> 18.41 s, 1.45x.
+
+On a real 1672x941 source: **8.99 s wall, 43.8 fps, 0.570x real-time.**
+
+⚠️ **Frame-exact comparison between runs is meaningless here** and it nearly produced a
+false regression report. `audio2motion` is a diffusion sampler with no fixed seed, so
+two *identical* unfused runs differ by mean 2.451 / max 190 — **more** than fused vs
+unfused (mean 2.087 / max 185). Any correctness claim needs the same-run-twice control,
+or deterministic single-stage inputs as used for the atol figure above.
+
+### Still open
+
+- `writer` is 12.3 ms/frame of CPU (ffmpeg pipe at source resolution). Not on the
+  critical path yet, but it is next if the rest gets faster. NVENC untried.
+- `audio2motion` at 6.54 s for 6 batched calls becomes the limiter once warp+decode
+  is graphed. Not attacked.
+- `channels_last` is a dead end as written: `dense_motion.py:100` does
+  `prediction.view(bs, -1, h, w)`, which raises on a non-contiguous layout. Untested
+  beyond that, and low priority now that the stage is not compute-bound.

@@ -1,3 +1,4 @@
+import os
 import threading
 import queue
 import numpy as np
@@ -10,6 +11,7 @@ from core.atomic_components.audio2motion import Audio2Motion
 from core.atomic_components.motion_stitch import MotionStitch
 from core.atomic_components.warp_f3d import WarpF3D
 from core.atomic_components.decode_f3d import DecodeF3D
+from core.atomic_components.warp_decode_fused import WarpDecodeFused
 from core.atomic_components.putback import PutBack
 from core.atomic_components.writer import VideoWriterByImageIO
 from core.atomic_components.wav2feat import Wav2Feat
@@ -38,6 +40,12 @@ class StreamSDK:
         self.motion_stitch = MotionStitch(stitch_network_cfg)
         self.warp_f3d = WarpF3D(warp_network_cfg)
         self.decode_f3d = DecodeF3D(decoder_cfg)
+        # Blackwell fork: see core/atomic_components/warp_decode_fused.py.
+        # DITTO_FUSE_WARP_DECODE=0 restores the two-worker path.
+        self.fuse_warp_decode = os.environ.get("DITTO_FUSE_WARP_DECODE", "1") != "0"
+        self.warp_decode = WarpDecodeFused(
+            self.warp_f3d, self.decode_f3d, use_cuda_graph=self.fuse_warp_decode
+        )
         self.putback = PutBack()
 
         self.wav2feat = Wav2Feat(**wav2feat_cfg)
@@ -156,6 +164,18 @@ class StreamSDK:
             source_info["x_s_info_lst"] = smooth_x_s_info_lst(source_info["x_s_info_lst"], smo_k=self.smo_k_s)
 
         self.source_info = source_info
+
+        # Blackwell fork: capture the warp+decode CUDA graph while the workers are
+        # all parked on empty queues. See WarpDecodeFused.prepare().
+        if getattr(self, "fuse_warp_decode", False):
+            try:
+                _f_s = source_info["f_s_lst"][0]
+                _num_kp = self.warp_f3d.warp_net.model.dense_motion_network.num_kp
+                _kp = np.zeros((1, _num_kp, 3), dtype=np.float32)
+                self.warp_decode.prepare(_f_s, _kp, _kp)
+            except Exception as e:
+                print(f"[StreamSDK] warp+decode graph pre-capture skipped: "
+                      f"{type(e).__name__}: {e}", flush=True)
         self.source_info_frames = len(source_info["x_s_info_lst"])
 
         # ======== Setup Condition Handler ========
@@ -226,8 +246,12 @@ class StreamSDK:
         self.thread_list = [
             threading.Thread(target=self.audio2motion_worker),
             threading.Thread(target=self.motion_stitch_worker),
+        ] + ([
+            threading.Thread(target=self.warp_decode_worker),
+        ] if self.fuse_warp_decode else [
             threading.Thread(target=self.warp_f3d_worker),
             threading.Thread(target=self.decode_f3d_worker),
+        ]) + [
             threading.Thread(target=self.putback_worker),
             threading.Thread(target=self.writer_worker),
         ]
@@ -307,6 +331,27 @@ class StreamSDK:
                 break
             frame_idx, f_3d = item
             render_img = self.decode_f3d(f_3d)
+            self.putback_queue.put([frame_idx, render_img])
+
+    def warp_decode_worker(self):
+        try:
+            self._warp_decode_worker()
+        except Exception as e:
+            self.worker_exception = e
+            self.stop_event.set()
+
+    def _warp_decode_worker(self):
+        while not self.stop_event.is_set():
+            try:
+                item = self.warp_f3d_queue.get(timeout=1)
+            except queue.Empty:
+                continue
+            if item is None:
+                self.putback_queue.put(None)
+                break
+            frame_idx, x_s, x_d = item
+            f_s = self.source_info["f_s_lst"][frame_idx]
+            render_img = self.warp_decode(f_s, x_s, x_d)
             self.putback_queue.put([frame_idx, render_img])
 
     def warp_f3d_worker(self):

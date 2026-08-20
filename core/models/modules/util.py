@@ -38,11 +38,23 @@ def kp2gaussian(kp, spatial_size, kp_variance):
     return out
 
 
+# Blackwell fork: the grid depends only on (spatial_size, dtype, device), all of
+# which are constant for a whole run -- but it was rebuilt on every forward, and
+# the arange() calls were allocated on the HOST and copied across. Two costs: a
+# per-frame H2D copy, and it makes the graph uncapturable (torch.cuda.graph
+# refuses a non-pinned CPU->CUDA copy during capture). Build on device, and cache.
+_COORD_GRID_CACHE = {}
+
+
 def make_coordinate_grid(spatial_size, ref, **kwargs):
     d, h, w = spatial_size
-    x = torch.arange(w).type(ref.dtype).to(ref.device)
-    y = torch.arange(h).type(ref.dtype).to(ref.device)
-    z = torch.arange(d).type(ref.dtype).to(ref.device)
+    key = (int(d), int(h), int(w), ref.dtype, ref.device)
+    cached = _COORD_GRID_CACHE.get(key)
+    if cached is not None:
+        return cached
+    x = torch.arange(w, dtype=ref.dtype, device=ref.device)
+    y = torch.arange(h, dtype=ref.dtype, device=ref.device)
+    z = torch.arange(d, dtype=ref.dtype, device=ref.device)
 
     # NOTE: must be right-down-in
     x = (2 * (x / (w - 1)) - 1)  # the x axis faces to the right
@@ -55,6 +67,7 @@ def make_coordinate_grid(spatial_size, ref, **kwargs):
 
     meshed = torch.cat([xx.unsqueeze_(3), yy.unsqueeze_(3), zz.unsqueeze_(3)], 3)
 
+    _COORD_GRID_CACHE[key] = meshed
     return meshed
 
 

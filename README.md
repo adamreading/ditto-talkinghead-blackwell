@@ -1,3 +1,25 @@
+> ### Blackwell (RTX 50-series) fork
+>
+> This is a fork of [antgroup/ditto-talkinghead](https://github.com/antgroup/ditto-talkinghead)
+> that runs on **sm_120 with no TensorRT**, streams, and is **faster than real time**
+> on a single RTX 5090: **8.84 s for 15.75 s of audio (41-54 fps)**, against 16.36 s
+> on the upstream code path.
+>
+> All of it is stock PyTorch — no TensorRT engine rebuild, no custom CUDA plugin.
+> The gains came from finding that the pipeline was **CPU-dispatch-bound** (~2000 GPU op
+> launches per frame, 20 ms of CPU against 8 ms of kernel time, GPU 24-41% idle), not
+> compute-bound.
+>
+> **Read [BLACKWELL.md](BLACKWELL.md)** for every measurement, the method, the two
+> dependency traps that invalidate benchmarks silently, and what is *not* verified.
+>
+> Quick start: `requirements-cu130.txt` (Python >= 3.11). `DITTO_FUSE_WARP_DECODE=0`
+> restores the upstream two-worker path for A/B.
+>
+> Upstream's README follows unchanged.
+
+---
+
 <h2 align='center'>Ditto: Motion-Space Diffusion for Controllable Realtime Talking Head Synthesis</h2>
 
 <div align='center'>

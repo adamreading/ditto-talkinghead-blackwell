@@ -17,12 +17,33 @@
 #       torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0
 #   uv pip install -r requirements-cu130.txt
 #
-# ⛔ DO NOT install onnxruntime-gpu. It requires a complete CUDA 12 runtime
-# (libcublasLt.so.12, libcufft.so.11, …) alongside a CUDA 13 torch. It fails
-# to load its provider and falls back to CPU *silently* — the warning changes
-# shape depending on which library is missing first, so it is easy to believe
-# you are on the GPU when you are not. Measured: no throughput difference
-# either way, because the ONNX stages are not the bottleneck (see BLACKWELL.md).
+# ⛔ onnxruntime-gpu ON PYTHON 3.10 — DO NOT. The last cp310 wheel is 1.23.2,
+# which is a CUDA 12 build: it wants libcufft.so.11 / libcublasLt.so.12 next to
+# a CUDA 13 torch, fails to load its provider, and falls back to CPU *silently*.
+# The warning changes shape depending on which library is missing first, so it
+# is easy to believe you are on the GPU when you are not.
+#
+# ⛔ AND IT POISONS TORCH. nvidia-cudnn-cu12 and nvidia-cudnn-cu13 install to the
+# SAME directory (nvidia/cudnn/lib/) — the cu12 wheel overwrites torch's cu13
+# cuDNN files in place. This is not a library-search-order problem you can fix
+# with LD_LIBRARY_PATH; the files are gone. Symptom: torch reports
+# cudnn 92400 (a cu12 build) under torch 2.11.0+cu130. Recovery:
+#   uv pip uninstall nvidia-cudnn-cu12
+#   uv pip install --reinstall-package nvidia-cudnn-cu13 nvidia-cudnn-cu13==9.19.0.56
+# (the uninstall deletes the shared files, so torch will not import until the
+# reinstall — measured, on this box.) Confirm with torch.backends.cudnn.version().
+#
+# ⚠️ CORRECTION, 2026-08-20. An earlier revision of this file said "no throughput
+# difference either way, because the ONNX stages are not the bottleneck". That was
+# WRONG and the measurement behind it was void: the onnxruntime-gpu being compared
+# had never loaded CUDA, so it was CPU vs CPU. Measured properly, hubert on the CPU
+# provider costs 63.9 ms per 200 ms chunk and 11.10s of an 18.25s run. See
+# BLACKWELL.md. The ONNX audio encoder is the largest single cost after conv.
+#
+# ⇒ TO USE THE GPU FOR ONNX, USE PYTHON >= 3.11. onnxruntime-gpu 1.26+ is itself a
+# CUDA 13 build (nvidia-cuda-runtime~=13.0, nvidia-cufft~=12.0, nvidia-cudnn-cu13~=9.0),
+# so it shares torch cu130's stack with nothing to clobber:
+#   uv venv --python 3.12 && uv pip install "onnxruntime-gpu[cuda,cudnn]==1.29.0"
 
 # --- torch triple: install separately from the cu130 index, see above ---
 # torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0

@@ -48,11 +48,73 @@ import time
 
 import librosa
 import numpy as np
+import soundfile as sf
 
 from stream_pipeline_online import StreamSDK
 
 CHUNKSIZE = (3, 5, 2)
 FPS = 25
+
+# Measured on an RTX 5090: the streaming path emits the right NUMBER of frames once
+# padded, but the final 44 frames carry no motion -- the same 44 on a 15.75s clip
+# (motion dies at frame 350 of 394) and a 21.74s clip (500 of 544). Constant, so it
+# is a fixed pipeline depth, not a rate mismatch.
+PAD_IS_NOT_SILENCE = """
+The end of a clip needs padding before generation, and the padding must NOT be
+digital silence.
+
+Measured: motion stops ~1.9s before the SPEECH ends, and appending silence does not
+recover it -- it extends the frozen region instead. Reproducible at both lengths:
+
+    speech 15.00s -> motion dies at 13.0s   (2.00s short)
+    speech 21.74s -> motion dies at 20.0s   (1.74s short)
+
+The cause is the motion model's window, not a dropped buffer. seq_frames=80 (3.2s),
+valid_clip_len=70 (2.8s), so the final ~2s of real speech sits in a window whose
+FUTURE half is the silence you appended -- and the model correctly renders a mouth
+coming to rest. It is reacting to the silence.
+
+Padding with speech-SHAPED audio instead (the tail reversed: right spectrum, no
+words) animates straight through. Frames 325-375, the previously dead zone, go from
+0.05 to 0.302 against a body rate of 0.313 -- a ratio of 0.96.
+
+⇒ This is a FILE-MODE artefact only. A live stream never contains an artificial
+silence cliff, so it needs no padding: the mouth comes to rest when the speaker
+actually stops, which is correct. Do not port this to a live path.
+"""
+
+
+def speech_filler(audio, pad_s, sr=16000):
+    """Speech-shaped tail filler. Reversed audio: same spectrum, no intelligible words."""
+    n = int(pad_s * sr)
+    if len(audio) == 0:
+        return np.zeros((n,), dtype=np.float32)
+    src = audio[-min(n, len(audio)):][::-1]
+    return np.tile(src, int(np.ceil(n / len(src))))[:n].astype(np.float32)
+
+
+def verify_tail(path, speech_frames):
+    """Assert the last second of SPEECH actually moves. Loud, not silent."""
+    try:
+        import imageio.v2 as iio
+    except ImportError:
+        print("verify: imageio unavailable, tail NOT checked")
+        return
+    prev, d = None, []
+    for f in iio.get_reader(path):
+        f = f.astype(np.int16)
+        if prev is not None:
+            d.append(np.abs(f - prev).mean())
+        prev = f
+    d = np.array(d)
+    if len(d) < speech_frames:
+        print(f"verify: FAILED -- {len(d)+1} frames for {speech_frames} of speech")
+        return
+    body = d[int(len(d) * 0.2):int(len(d) * 0.7)].mean()
+    tail = d[max(0, speech_frames - FPS):speech_frames].mean()
+    ratio = tail / body if body else 0.0
+    verdict = "OK" if ratio > 0.5 else "⛔ FROZEN OVER SPEECH -- raise --tail_pad_s"
+    print(f"verify tail   last 1s of speech moves {ratio:.2f}x the body rate  {verdict}")
 
 
 def stream(SDK, audio, chunksize=CHUNKSIZE):
@@ -78,9 +140,9 @@ def main():
     ap.add_argument("--output_path", required=True)
     ap.add_argument("--sampling_timesteps", type=int, default=None,
                     help="diffusion steps for audio2motion (upstream default 50)")
-    ap.add_argument("--tail_flush_s", type=float, default=3.0,
-                    help="silence appended to flush in-flight frames; over-flush "
-                         "then trim. Raise it if the frame count still falls short.")
+    ap.add_argument("--tail_pad_s", type=float, default=3.0,
+                    help="Seconds of SPEECH-SHAPED filler appended before generation "
+                         "and trimmed after. Must not be silence -- see PAD_IS_NOT_SILENCE.")
     a = ap.parse_args()
 
     t0 = time.time()
@@ -96,13 +158,14 @@ def main():
     t_setup = time.time() - t0
 
     audio, _ = librosa.core.load(a.audio_path, sr=16000)
-    duration = len(audio) / 16000
-    want_frames = math.ceil(duration * FPS)
-    SDK.setup_Nd(N_d=want_frames)
+    speech_s = len(audio) / 16000
+    speech_frames = math.ceil(speech_s * FPS)
+
+    fed = np.concatenate([audio, speech_filler(audio, a.tail_pad_s)], 0)
+    SDK.setup_Nd(N_d=math.ceil(len(fed) / 16000 * FPS))
 
     t0 = time.time()
-    stream(SDK, np.concatenate(
-        [audio, np.zeros((int(a.tail_flush_s * 16000),), dtype=np.float32)], 0))
+    stream(SDK, fed)
     SDK.close()
     t_gen = time.time() - t0
 
@@ -113,16 +176,22 @@ def main():
     # Trim to the frames the audio implies, then mux. -frames:v is applied to the
     # decoded stream, so this cuts the over-flushed tail without re-encoding video.
     cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", tmp, "-i", a.audio_path,
-           "-frames:v", str(want_frames), "-map", "0:v", "-map", "1:a",
+           "-frames:v", str(speech_frames), "-map", "0:v", "-map", "1:a",
            "-c:v", "copy", "-c:a", "aac", a.output_path]
     if subprocess.run(cmd).returncode != 0:
         sys.exit("FAILED: ffmpeg mux/trim returned non-zero")
 
+    # ⛔ VERIFY THE SPEECH IS ANIMATED, do not assume the padding was enough.
+    # A frozen face over live speech is the failure this whole argument exists for,
+    # and it is invisible in the frame COUNT -- which is why it survived one round
+    # of "fixed" already. Measure and say so.
+    verify_tail(a.output_path, speech_frames)
+
     print(f"model load   {t_load:6.2f}s   (once per process)")
     print(f"avatar setup {t_setup:6.2f}s   (once per face)")
-    print(f"generation   {t_gen:6.2f}s   for {duration:.2f}s audio = "
-          f"{t_gen / duration:.2f}x real-time")
-    print(f"output       {a.output_path}  ({want_frames} frames expected)")
+    print(f"generation   {t_gen:6.2f}s   for {speech_s:.2f}s audio = "
+          f"{t_gen / speech_s:.2f}x real-time")
+    print(f"output       {a.output_path}  ({speech_frames} frames)")
 
 
 if __name__ == "__main__":

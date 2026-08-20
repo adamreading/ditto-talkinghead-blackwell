@@ -71,30 +71,72 @@ feed loop       0.55x real-time          ← audio ingestion is ~2x faster than 
 it, `N_d` only drives end-of-clip eye-open and fade alphas — **cosmetic**. An estimate
 is safe.
 
-## 3. ⛔ The streaming path silently truncates the end of every clip
+## 3. ⛔ The end of a clip goes still ~2 s early — and padding with silence makes it worse
 
-`inference.py`'s online branch feeds chunks then calls `close()` immediately, losing
-the frames still in flight:
+⚠️ **This section replaces an earlier, wrong version of itself.** That version said the
+streaming path loses frames still in flight, and that padding recovers "exactly 25 frames
+per second of padding, 1:1 with the framerate". The frame COUNT does behave that way. The
+recovered frames are **frozen**, and trimming to the audio-implied count made the count
+correct while hiding the content loss — a fix that looked like a fix. Kept here because
+the wrong version is the more tempting reading.
 
-| tail padding | frames out |
-|---|---|
-| none | 340 (**54 short**) |
-| 0.6 s | 355 |
-| 1.2 s | 370 |
-| 2.4 s | 400 |
+**What actually happens.** Motion stops ~1.9 s before the *speech* ends, and appending
+silence does not convert those frames to motion — it extends the frozen region:
 
-Exactly 25 frames recovered per second of padding — 1:1 with the framerate, so a fixed
-pipeline depth rather than a rate mismatch. The visible symptom is **lipsync drifting
-off in the final ~2 s**, which reads as a model-quality problem and is not one.
+| speech length | motion dies at | short by |
+|---|---|---|
+| 15.00 s (375 frames) | 13.0 s (frame 325) | 2.00 s |
+| 21.74 s (544 frames) | 20.0 s (frame 500) | 1.74 s |
 
-`chunksize=(3,5,2)` does not predict 54, and the depth is not derivable from the
-published config, so `inference_stream.py` does not hardcode a formula. It
-**over-flushes and then trims** to the frame count the audio implies. Verified: 394
-frames out for a 15.75 s clip, matching the offline path exactly.
+Reproducible at 3.0 / 5.0 / 6.0 / 8.0 s of padding — the dead zone does not move. That
+rules out a dropped buffer, because more padding would shift it.
 
-The flush costs time (18.75 s of audio processed for 15.75 s of video → 1.03x becomes
-1.42x). In continuous conversation the *next* utterance flushes the previous one, so
-only the final utterance pays.
+**The cause is the motion model's window.** `seq_frames = 80` (3.2 s),
+`overlap_v2 = 10`, so `valid_clip_len = 70` (2.8 s). The last ~2 s of real speech sits in
+a window whose *future* half is the silence you appended, and the model correctly renders
+a mouth coming to rest. It is responding to the silence, not failing.
+
+**The fix is speech-SHAPED filler.** `inference_stream.py` appends the tail reversed —
+same spectrum, no intelligible words — generates, then trims to the speech frame count
+and muxes the original audio. The previously dead zone (frames 325-375) goes from 0.05 to
+**0.302 against a body rate of 0.313**, a ratio of 0.96.
+
+`inference_stream.py` also **verifies this and says so**, rather than trusting it:
+
+```
+verify tail   last 1s of speech moves 0.89x the body rate  OK
+```
+
+A frozen face over live speech is invisible in the frame count, which is exactly how it
+survived one round of being "fixed". Below 0.5x it prints `⛔ FROZEN OVER SPEECH`.
+
+⇒ **This is a file-mode artefact only. Do not port it to a live path.** A live stream
+contains no artificial silence cliff, so it needs no padding — the mouth comes to rest
+when the speaker actually stops, which is what you want.
+
+### Latency, which is the number that matters for a live avatar
+
+Feeding a 21.74 s clip in 200 ms hops **paced at real time**, as a live TTS would:
+
+```
+first frame out      5.61 s after audio starts
+steady-state lag     ~4.4 s behind the audio
+```
+
+That is not a throughput problem — generation runs at 0.62x real-time, so it is idle
+waiting. It is the model's 3.2 s window plus pipeline fill.
+
+Feeding the same clip **flat out**, i.e. the utterance already exists:
+
+```
+first frame out      2.31 s
+steady-state lag     negative — generation outruns playback and keeps pulling ahead
+```
+
+⇒ For an avatar speaking a *prepared* utterance (TTS finishes, then animate), the cost is
+**~2.3 s to first moving frame** and no risk of underrun after. For an avatar animating
+*live* incoming audio, the floor is ~4.4 s with this model, which is too slow for
+conversation and is architectural rather than an optimisation target.
 
 Separately: `inference.py` muxes audio with ffmpeg **after** `SDK.close()`, outside the
 SDK. Call `close()` yourself and you get a silent `<output>.tmp.mp4` and no final file,

@@ -44,3 +44,6 @@ checkpoints/
 out/
 .venv/
 *.tmp.mp4
+
+# scratch space for examples/live_stream_server.py (override with OUTDIR)
+examples/out/

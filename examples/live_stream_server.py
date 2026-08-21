@@ -107,7 +107,9 @@ SYSTEM = os.environ.get("SYSTEM_PROMPT",
     "most three short spoken sentences. No markdown, no lists, no emoji, no stage "
     "directions -- every word is read aloud.")
 
-OUTDIR = os.path.join(HERE, "out", "live")
+# Scratch space for mic uploads and the audio FIFO. Keep it OUT of the repo when
+# running from a checkout.
+OUTDIR = os.environ.get("OUTDIR", os.path.join(HERE, "out", "live"))
 os.makedirs(OUTDIR, exist_ok=True)
 
 

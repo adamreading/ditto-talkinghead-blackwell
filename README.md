@@ -294,7 +294,21 @@ a particular host.
 | `LEAD_FRAMES` | `53` (constant) | alignment lead — **empirically tuned, not derived** |
 | `AV_OFFSET_MS` | `240` | residual video delay; positive = delay video |
 | `DITTO_GAIN` | `0` (off) | normalise audio into the model. Measured: no effect (r 0.322 -> 0.325) |
+| `OUTDIR` | `examples/out/live` | scratch for mic uploads + the audio FIFO; point it outside a checkout |
 | `PORT` | `7870` | binds loopback only |
+
+Run it from an env file rather than a private fork of the code — that is the whole point of
+the table above. A launcher that keeps credentials off disk:
+
+```bash
+set -a; . ./my-avatar.env; set +a          # everything except the secrets
+export TTS_API_KEY="$(get-secret tts)"     # from your own secret store, at launch
+export STT_API_KEY="$(get-secret stt)"
+exec python examples/live_stream_server.py
+```
+
+⚠️ The env file is **sourced by bash**, so quote any value containing an apostrophe —
+`SYSTEM_PROMPT` with a possessive in it will otherwise fail with `unexpected EOF`.
 
 ### Things that cost real time to learn
 

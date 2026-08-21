@@ -41,6 +41,7 @@ Configure entirely by environment -- see the table at the bottom of README.md.
 Run:  python examples/live_stream_server.py
       then open http://127.0.0.1:7870
 """
+import hmac
 import json
 import math
 import os
@@ -75,6 +76,17 @@ PORT = int(os.environ.get("PORT", "7870"))
 # ~15s utterance and destroyed the correlation (r 0.34 -> 0.06). Repeating the first
 # frame is the boring version that works.
 AV_OFFSET_MS = int(os.environ.get("AV_OFFSET_MS", "240"))
+
+# --- access control -------------------------------------------------------
+# AVATAR_TOKEN gates the routes that START WORK (/turn, /say). Empty = open, which is
+# only safe on loopback or a private network. Expose this publicly without a token and
+# anyone who finds the URL can make your avatar talk and occupy your GPU.
+AVATAR_TOKEN = os.environ.get("AVATAR_TOKEN", "")
+# /stream/<id> and /log/<id> are NOT token-gated: the Activity's viewers need them and
+# anything embedded in a page is readable by everyone who loads it. They are protected
+# by the turn id being an unguessable 96-bit capability instead. Real per-viewer
+# authorisation belongs upstream (verify the Discord OAuth token, check guild+channel).
+MAX_CONCURRENT_TURNS = int(os.environ.get("MAX_CONCURRENT_TURNS", "1"))
 # Target peak for the audio fed to Ditto (0 = off). Playback loudness is handled
 # separately by speechnorm in the muxer; this is purely what the MODEL hears.
 DITTO_GAIN = float(os.environ.get("DITTO_GAIN", "0"))
@@ -366,6 +378,7 @@ class Turn:
 
 
 TURNS = {}
+INFLIGHT = threading.Semaphore(MAX_CONCURRENT_TURNS)
 
 
 # --------------------------------------------------------------------------
@@ -626,11 +639,17 @@ const MIMES=['video/mp4; codecs="avc1.42C028, mp4a.40.2"',
              'video/mp4; codecs="avc1.4D4028, mp4a.40.2"',
              'video/mp4'];
 let MIME=null, diag=[];
+// ⛔ Injected server-side so the built-in page works when a token is set. It is
+// therefore VISIBLE to anyone who can load this page -- fine on loopback or a private
+// network, NOT a way to protect a public deployment. A public front end must
+// authenticate its viewer instead (e.g. Discord OAuth) and never ship a shared secret.
+const AVATAR_TOKEN = "__AVATAR_TOKEN__";
 function dg(m){diag.push(m); log.textContent=diag.join('\n');}
 
 async function send(form){
   log.textContent='sending…';
-  const r=await fetch('/turn',{method:'POST',body:form});
+  const r=await fetch('/turn',{method:'POST',body:form,
+    headers: AVATAR_TOKEN ? {'X-Avatar-Token': AVATAR_TOKEN} : {}});
   const j=await r.json();
   if(j.error){log.textContent='ERROR: '+j.error;return;}
   log.textContent='heard: '+j.heard; start(j.id);
@@ -776,7 +795,8 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         self._trace()
         if self.path == "/":
-            return self._send(200, "text/html; charset=utf-8", PAGE.encode())
+            page = PAGE.replace("__AVATAR_TOKEN__", AVATAR_TOKEN)
+            return self._send(200, "text/html; charset=utf-8", page.encode())
         if self.path.startswith("/log/"):
             t = TURNS.get(self.path[5:])
             if not t:
@@ -805,10 +825,19 @@ class H(BaseHTTPRequestHandler):
             return
         return self._send(404, "text/plain", b"not found")
 
+    def _authorised(self):
+        if not AVATAR_TOKEN:
+            return True
+        got = self.headers.get("X-Avatar-Token", "")
+        # constant time: a token check that leaks length or prefix by timing is not one
+        return hmac.compare_digest(got.encode(), AVATAR_TOKEN.encode())
+
     def do_POST(self):
         self._trace()
         if self.path not in ("/turn", "/say"):
             return self._send(404, "text/plain", b"not found")
+        if not self._authorised():
+            return self._send(401, "application/json", b'{"error":"unauthorised"}')
         verbatim = self.path == "/say"
         n = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(n)
@@ -835,8 +864,17 @@ class H(BaseHTTPRequestHandler):
             turn = Turn(text)
             TURNS[turn.id] = turn
             turn.note(f"heard: {text}")
-            threading.Thread(target=run_turn, args=(turn, text),
-                             kwargs={"verbatim": verbatim}, daemon=True).start()
+            if not INFLIGHT.acquire(blocking=False):
+                return self._send(429, "application/json",
+                                  b'{"error":"busy - a turn is already running"}')
+
+            def _guarded():
+                try:
+                    run_turn(turn, text, verbatim=verbatim)
+                finally:
+                    INFLIGHT.release()
+
+            threading.Thread(target=_guarded, daemon=True).start()
             return self._send(200, "application/json",
                               json.dumps({"id": turn.id, "heard": text}).encode())
         except Exception as e:

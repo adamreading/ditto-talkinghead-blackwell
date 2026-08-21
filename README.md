@@ -295,6 +295,8 @@ a particular host.
 | `AV_OFFSET_MS` | `240` | residual video delay; positive = delay video |
 | `DITTO_GAIN` | `0` (off) | normalise audio into the model. Measured: no effect (r 0.322 -> 0.325) |
 | `OUTDIR` | `examples/out/live` | scratch for mic uploads + the audio FIFO; point it outside a checkout |
+| `AVATAR_TOKEN` | *(empty = open)* | required as `X-Avatar-Token` on `/turn` and `/say`. **Set it before exposing this anywhere.** |
+| `MAX_CONCURRENT_TURNS` | `1` | further requests get 429 rather than queueing GPU work |
 | `PORT` | `7870` | binds loopback only |
 
 Run it from an env file rather than a private fork of the code — that is the whole point of
@@ -309,6 +311,24 @@ exec python examples/live_stream_server.py
 
 ⚠️ The env file is **sourced by bash**, so quote any value containing an apostrophe —
 `SYSTEM_PROMPT` with a possessive in it will otherwise fail with `unexpected EOF`.
+
+### Exposing it — read this first
+
+`AVATAR_TOKEN` gates the routes that start work. Without it, anyone who finds the URL can
+make your avatar talk and occupy your GPU indefinitely; `MAX_CONCURRENT_TURNS` bounds that
+to one turn at a time. Verified: no token 401, wrong token 401, correct token 200, second
+concurrent turn 429.
+
+**`/stream/<id>` and `/log/<id>` are deliberately NOT token-gated.** A browser front end
+has to fetch them, and any secret embedded in a page is readable by everyone who loads that
+page. They rely on the turn id being an unguessable 96-bit capability instead.
+
+⛔ **The token the built-in page carries is therefore public to that page's viewers.** It is
+fine on loopback or a private network (Tailscale, LAN) and is *not* a way to protect a
+public deployment. A public front end must authenticate its own viewer — for a Discord
+Activity, that means the Embedded App SDK's OAuth handshake, verified server-side against
+the guild and channel you expect, which is also the only channel restriction that cannot be
+bypassed by guessing a URL.
 
 ### Things that cost real time to learn
 

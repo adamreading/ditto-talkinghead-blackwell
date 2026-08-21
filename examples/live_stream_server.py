@@ -51,6 +51,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -87,6 +88,12 @@ AVATAR_TOKEN = os.environ.get("AVATAR_TOKEN", "")
 # by the turn id being an unguessable 96-bit capability instead. Real per-viewer
 # authorisation belongs upstream (verify the Discord OAuth token, check guild+channel).
 MAX_CONCURRENT_TURNS = int(os.environ.get("MAX_CONCURRENT_TURNS", "1"))
+# Output height (width follows the source aspect, rounded to even). The model works at a
+# fixed internal resolution and the scale-up is free, so this costs nothing in lip sync
+# quality -- see BLACKWELL.md section 5. It only changes bitrate: 1672x940 measured
+# 4.63 Mbit/s (34.8 MB/min), which is absurd for an iframe nobody views fullscreen.
+# 0 = native source size.
+OUT_HEIGHT = int(os.environ.get("OUT_HEIGHT", "0"))
 # Target peak for the audio fed to Ditto (0 = off). Playback loudness is handled
 # separately by speechnorm in the muxer; this is purely what the MODEL hears.
 DITTO_GAIN = float(os.environ.get("DITTO_GAIN", "0"))
@@ -237,6 +244,10 @@ class Turn:
         h -= h % 2
         w -= w % 2
         self._size = (w, h)
+        scale = []
+        if OUT_HEIGHT and OUT_HEIGHT < h:
+            ow = max(2, int(round(w * OUT_HEIGHT / h)) & ~1)
+            scale = ["-vf", f"scale={ow}:{OUT_HEIGHT}"]
         self._afifo = os.path.join(OUTDIR, f"{self.id}.apcm")
         if os.path.exists(self._afifo):
             os.remove(self._afifo)
@@ -246,6 +257,7 @@ class Turn:
                "-r", str(FPS), "-i", "pipe:0",
                "-f", "s16le", "-ar", str(TTS_SR), "-ac", "1", "-i", self._afifo,
                "-map", "0:v", "-map", "1:a",
+               *scale,
                "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
                # Profile PINNED to what -preset ultrafast actually emits. Asking for
                # main and getting "Constrained Baseline" is what happened, and the MSE
@@ -794,7 +806,15 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._trace()
-        if self.path == "/":
+        if self.path == "/" or self.path.startswith("/?"):
+            # With a token set, the PAGE ITSELF requires it: ?t=<token>. Otherwise the
+            # link you share is safe to paste but a bare hostname visit gets nothing --
+            # which matters the moment this is reachable from the open internet.
+            if AVATAR_TOKEN:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                given = (q.get("t") or [""])[0]
+                if not hmac.compare_digest(given.encode(), AVATAR_TOKEN.encode()):
+                    return self._send(403, "text/plain", b"forbidden")
             page = PAGE.replace("__AVATAR_TOKEN__", AVATAR_TOKEN)
             return self._send(200, "text/html; charset=utf-8", page.encode())
         if self.path.startswith("/log/"):

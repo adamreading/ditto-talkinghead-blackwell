@@ -297,6 +297,7 @@ a particular host.
 | `OUTDIR` | `examples/out/live` | scratch for mic uploads + the audio FIFO; point it outside a checkout |
 | `AVATAR_TOKEN` | *(empty = open)* | required as `X-Avatar-Token` on `/turn` and `/say`. **Set it before exposing this anywhere.** |
 | `MAX_CONCURRENT_TURNS` | `1` | further requests get 429 rather than queueing GPU work |
+| `OUT_HEIGHT` | `0` (native) | scale the output; **1672x940 measures 4.63 Mbit/s, 432p measures 1.39** and lip sync is unaffected |
 | `PORT` | `7870` | binds loopback only |
 
 Run it from an env file rather than a private fork of the code — that is the whole point of
@@ -318,6 +319,9 @@ exec python examples/live_stream_server.py
 make your avatar talk and occupy your GPU indefinitely; `MAX_CONCURRENT_TURNS` bounds that
 to one turn at a time. Verified: no token 401, wrong token 401, correct token 200, second
 concurrent turn 429.
+
+With a token set, **the page itself requires `?t=<token>`** — so a link you share works
+and a bare hostname visit gets 403. Verified: bare 403, `?t=` 200.
 
 **`/stream/<id>` and `/log/<id>` are deliberately NOT token-gated.** A browser front end
 has to fetch them, and any secret embedded in a page is readable by everyone who loads that

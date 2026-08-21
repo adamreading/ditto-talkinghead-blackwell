@@ -1,20 +1,32 @@
-> ### Blackwell (RTX 50-series) fork
+> ### Blackwell (RTX 50-series) fork — plus working lip sync and a live streaming server
 >
-> This is a fork of [antgroup/ditto-talkinghead](https://github.com/antgroup/ditto-talkinghead)
-> that runs on **sm_120 with no TensorRT**, streams, and is **faster than real time**
-> on a single RTX 5090: **8.84 s for 15.75 s of audio (41-54 fps)**, against 16.36 s
-> on the upstream code path.
+> A fork of [antgroup/ditto-talkinghead](https://github.com/antgroup/ditto-talkinghead) that
+> runs on **sm_120 with no TensorRT**, streams, is **faster than real time** on one RTX 5090,
+> and — the part that took longest — has **lip sync that is actually in sync**.
 >
-> All of it is stock PyTorch — no TensorRT engine rebuild, no custom CUDA plugin.
-> The gains came from finding that the pipeline was **CPU-dispatch-bound** (~2000 GPU op
-> launches per frame, 20 ms of CPU against 8 ms of kernel time, GPU 24-41% idle), not
-> compute-bound.
+> **1.85x faster: 8.84 s for 15.75 s of audio (41-54 fps)**, against 16.36 s upstream. All
+> stock PyTorch: no engine rebuild, no custom CUDA plugin. The premise was wrong rather than
+> the kernels — the pipeline is **CPU-dispatch-bound** (~1985 GPU op launches per frame,
+> 20 ms of CPU against 8 ms of kernel time, GPU 24-41% idle). `grid_sample`, the thing
+> everyone writes a TensorRT plugin for, is 0.2% of the run.
 >
-> **Read [BLACKWELL.md](BLACKWELL.md)** for every measurement, the method, the two
-> dependency traps that invalidate benchmarks silently, and what is *not* verified.
+> **Lip sync was ~1.7 s out, and every duration check said it was fine.** Frame counts
+> matched, video and audio durations matched, `ffprobe` was clean. What found it was
+> measuring lip aperture per frame against the audio envelope: correlation **0.52 at a lag
+> of -43 frames** — the mouth confidently doing the right thing at the wrong moment. Now
+> **0 frames**. How to spot it in ten seconds, plus the two mechanisms I convinced myself of
+> that were both wrong, are in [BLACKWELL.md §3](BLACKWELL.md).
 >
-> Quick start: `requirements-cu130.txt` (Python >= 3.11). `DITTO_FUSE_WARP_DECODE=0`
-> restores the upstream two-worker path for A/B.
+> **`examples/live_stream_server.py`** is a working live pipeline: mic -> STT -> streamed LLM
+> -> streaming TTS -> Ditto -> fragmented MP4 in the browser, frames pushed out as the voice
+> is produced rather than rendered to a file first. Zero dependencies beyond the model stack
+> and ffmpeg.
+>
+> **Read [BLACKWELL.md](BLACKWELL.md)** for every measurement, the method, the two dependency
+> traps that silently invalidate benchmarks, and an explicit list of what is *not* verified.
+>
+> Quick start: `requirements-cu130.txt`, **Python >= 3.11**.
+> `DITTO_FUSE_WARP_DECODE=0` restores the upstream two-worker path for A/B.
 >
 > Upstream's README follows unchanged.
 
@@ -259,3 +271,55 @@ If you find this codebase useful for your research, please use the following ent
 ## 🌟 Star History
 
 [![Star History Chart](https://api.star-history.com/svg?repos=antgroup/ditto-talkinghead&type=Date)](https://www.star-history.com/#antgroup/ditto-talkinghead&Date)
+
+---
+
+## Live streaming server — configuration
+
+`examples/live_stream_server.py`. Everything is environment-driven; nothing is hardcoded to
+a particular host.
+
+| variable | default | notes |
+|---|---|---|
+| `WHISPER_URL` | `http://127.0.0.1:9000/v1/audio/transcriptions` | OpenAI-shaped STT |
+| `STT_API_KEY` | *(empty)* | **whisper returns 401 without one.** A typed turn skips STT, so this failure is invisible until someone speaks |
+| `STT_PROMPT` | *(empty)* | vocabulary hint; without it proper nouns get mangled and it reads as a bad model |
+| `TTS_URL` | `http://127.0.0.1:8881/v1/audio/speech` | must support `stream:true` + `response_format:pcm` |
+| `TTS_API_KEY` | *(empty)* | |
+| `TTS_VOICE` | `en-Finn_man` | |
+| `LLM_URL` | `http://127.0.0.1:8090/v1/chat/completions` | OpenAI-shaped, streaming |
+| `LLM_MODEL` | `local-model` | |
+| `FACE_IMAGE` | `example/image.png` | head-and-shoulders, mouth closed, facing forward |
+| `STEPS` | `15` | diffusion steps; nearly free in wall-clock, see BLACKWELL.md |
+| `LEAD_FRAMES` | `53` (constant) | alignment lead — **empirically tuned, not derived** |
+| `AV_OFFSET_MS` | `240` | residual video delay; positive = delay video |
+| `DITTO_GAIN` | `0` (off) | normalise audio into the model. Measured: no effect (r 0.322 -> 0.325) |
+| `PORT` | `7870` | binds loopback only |
+
+### Things that cost real time to learn
+
+**Use a reasoning model and it will think instead of speaking.** A qwen3-class model
+streamed 120 `reasoning_content` deltas and never emitted one word of `content`. Needs
+`chat_template_kwargs: {"enable_thinking": false}`; with it, first content at 0.43 s. Read
+`content` only — never `reasoning_content`, or the avatar reads its own monologue aloud.
+
+**Give audio and video their own writer threads.** ffmpeg will not drain the video pipe
+until it can also read audio. If audio is pushed by the same thread that feeds the model,
+and the model's writer blocks on the video pipe, all three deadlock: ffmpeg waits for audio,
+audio waits for the model, the model waits for ffmpeg. It wedges silently.
+
+**Budget frames against arrived audio.** The speech-shaped tail padding generates frames
+too. Letting them into the muxer put the video 1.2 s ahead of the audio on a three-sentence
+reply, accumulating per sentence. Emitting a frame only when the delivered audio justifies
+it makes drift structurally impossible rather than merely absent.
+
+**iPad Safari will not play a chunked fMP4 from `<video src>`** — its media loader wants
+byte-range requests and abandons a `Transfer-Encoding: chunked` response. Use MediaSource.
+And the codec string must match the bitstream: `-preset ultrafast` silently overrides
+`-profile:v main` and emits **Constrained Baseline**, so `avc1.4D4028` fails to append while
+`isTypeSupported` still returns true. Check with `ffprobe`, don't assume.
+
+**Frame-exact comparison between two runs is meaningless.** The motion model is a diffusion
+sampler with no fixed seed: two *identical* runs differ by mean 2.45 / max 190, which is
+MORE than a real change measured at 2.09 / 185. Any correctness claim needs a
+same-input-twice control first.

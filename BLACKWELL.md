@@ -114,6 +114,64 @@ survived one round of being "fixed". Below 0.5x it prints `⛔ FROZEN OVER SPEEC
 contains no artificial silence cliff, so it needs no padding — the mouth comes to rest
 when the speaker actually stops, which is what you want.
 
+### ⛔ AND THERE IS A SYSTEMATIC ~1.7 s A/V OFFSET ON TOP — the bigger defect
+
+Everything above is about the END of a clip. Separately, and worse, **the whole clip is
+misaligned**. Measured by extracting lip aperture per frame with a face landmarker
+(inner-lip gap normalised by mouth width) and cross-correlating it against the audio
+envelope at 25 Hz:
+
+| configuration | peak lag | r |
+|---|---|---|
+| as shipped | **-43 frames (-1720 ms)** | 0.52 |
+| one session per turn + lead padding | +6 frames (+240 ms) | 0.34 |
+| + 240 ms video hold | **0 frames** | 0.32 |
+
+r = 0.52 at the wrong lag is the signature to look for: the mouth is confidently doing
+the right thing at the wrong time. Frame counts and durations all matched throughout, so
+nothing in a `ffprobe` check can see this.
+
+**How to see it without any metric.** Take the loudest audio frame and a silent one and
+put them side by side. Ours had the mouth nearly shut on the loudest frame and wide open
+during digital silence. That two-frame comparison is worth more than an hour of
+correlation plots.
+
+**What fixed it, in order of effect:**
+
+1. **One pipeline session per utterance, not per sentence.** Each `setup()`/`close()`
+   cycle re-pays the pipeline's fill AND re-applies any correction, so a three-sentence
+   reply was misaligned three times over. It also costs ~1 s of avatar re-registration
+   per sentence.
+2. **Lead-in padding** so the pipeline's fill consumes filler instead of the first words.
+3. **A residual video delay**, applied by repeating the first frame.
+
+⚠️ **THE MECHANISM IS NOT SETTLED, and two plausible stories were both wrong.** The
+emitted frame count is reliably `fed_frames - 53` (437->385, 618->565, 743->690), which
+looks like a front-loading loss, and an onset probe (2 s silence / 2 s speech / 2 s
+silence) put mouth activity at 0.0-2.8 s against speech at 2.0-4.0 s — i.e. the video
+LEADS. But cross-correlation on real speech says it LAGS. The onset probe is the
+unreliable one: the pipeline emits startup mouth motion during leading silence
+regardless, which is easy to read as speech arriving early. Treat the lead as an
+empirically tuned constant, not a derived one, and **measure after changing it**.
+
+⛔ **Do NOT correct the residual with ffmpeg `-itsoffset` on a piped input.** It produced
+3521 frames for a ~15 s utterance and destroyed the correlation (r 0.34 -> 0.06).
+Repeating the first frame is the boring version that works.
+
+### Two levers that do NOT help, so you can skip them
+
+**Normalising the audio into the model.** Plausible: the model was hearing -28 dBFS
+because loudness normalisation ran in the muxer, i.e. after the pipeline. Measured: r
+0.322 -> 0.325. No effect. Keep normalisation for playback only.
+
+**Raising the diffusion step count for speed reasons.** `sampling_timesteps` 5 -> 15 does
+improve accuracy — against a 50-step reference the mouth trajectory error more than
+halves (mean deviation 0.079 -> 0.034 on an aperture range of 0.02-0.55) while shape
+correlation stays 0.98, and end-to-end alignment r goes 0.32 -> 0.41. But it is nearly
+FREE in wall-clock terms and therefore not a speed lever: a full streaming turn measured
+1.47x real-time at 15 steps, 1.46x at 10, and the same at 5. Steps are not the
+bottleneck; take the quality.
+
 ### Latency, which is the number that matters for a live avatar
 
 Feeding a 21.74 s clip in 200 ms hops **paced at real time**, as a live TTS would:

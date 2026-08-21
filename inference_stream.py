@@ -84,6 +84,21 @@ actually stops, which is correct. Do not port this to a live path.
 """
 
 
+# ⛔ THE PIPELINE SWALLOWS ITS FIRST ~53 FRAMES, AT THE FRONT, NOT THE TAIL.
+# Emitted frame count is always fed_frames - 53, measured across lengths:
+#   fed 437 -> 385   fed 618 -> 565   fed 743 -> 690
+# and an onset probe (2s silence, 2s speech, 2s silence) shows mouth activity at
+# 0.0-2.8s against speech at 2.0-4.0s -- i.e. emitted frame 0 corresponds to audio
+# at ~2.12s, so pairing it with t=0 makes the video LEAD by two seconds.
+#
+# This is what "lip sync is way off" was, and an earlier revision of this file
+# misdiagnosed the same 53 frames as a TAIL loss and "fixed" it by trimming, which
+# preserved the frame count and left the shift in place.
+#
+# So: pad the FRONT by exactly the lead, and let the swallow consume filler.
+LEAD_FRAMES = 53
+
+
 def speech_filler(audio, pad_s, sr=16000):
     """Speech-shaped tail filler. Reversed audio: same spectrum, no intelligible words."""
     n = int(pad_s * sr)
@@ -161,7 +176,8 @@ def main():
     speech_s = len(audio) / 16000
     speech_frames = math.ceil(speech_s * FPS)
 
-    fed = np.concatenate([audio, speech_filler(audio, a.tail_pad_s)], 0)
+    lead = speech_filler(audio, LEAD_FRAMES / FPS)
+    fed = np.concatenate([lead, audio, speech_filler(audio, a.tail_pad_s)], 0)
     SDK.setup_Nd(N_d=math.ceil(len(fed) / 16000 * FPS))
 
     t0 = time.time()
